@@ -20,6 +20,34 @@ namespace BackupTables
             }
         }
         
+        private static string SaveBinary(SqlDataReader reader, int field, string parentFile)
+        {
+            var logger = new ThrottledLogger();
+            var folder = Path.GetDirectoryName(parentFile);
+            var name = Guid.NewGuid() + ".blob";
+
+            var buffer = new byte[0x10000];
+
+            Console.WriteLine($"Saving blob to {name}");
+
+            using (var stream = reader.GetStream(field))
+            using (var file = new FileStream(Path.Combine(folder, name), FileMode.Create, FileAccess.Write))
+            {
+                var got = 0;
+                var total = 0;
+                while ((got = stream.Read(buffer, 0, buffer.Length)) != 0)
+                {
+                    file.Write(buffer, 0, got);
+
+                    total += got;
+                    logger.Add($"-- saved {total} bytes so far");
+                }
+            }
+
+            Console.WriteLine($"Finished saving blob to {name}");
+            return name;
+        }
+
         private static void Export(string fileName, IEnumerable<string> tables, SqlConnection conn)
         {
             var logger = new ThrottledLogger();
@@ -55,7 +83,10 @@ namespace BackupTables
                             {
                                 var name = reader.GetName(f);
                                 var type = reader.GetFieldType(f);
-                                var val = reader.IsDBNull(f) ? null : reader.GetValue(f);
+                                
+                                var val = reader.IsDBNull(f) ? null : 
+                                        type == typeof(byte[]) ? SaveBinary(reader, f, fileName) : 
+                                        reader.GetValue(f);
 
                                 var fieldElem = new XElement("field");
                                 recordElem.Add(fieldElem);
