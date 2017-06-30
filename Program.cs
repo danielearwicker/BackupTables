@@ -21,8 +21,7 @@ namespace BackupTables
         }
         
         private static string SaveBinary(SqlDataReader reader, int field, string parentFile)
-        {
-            var logger = new ThrottledLogger();
+        {            
             var folder = Path.GetDirectoryName(parentFile);
             var name = Guid.NewGuid() + ".blob";
 
@@ -30,6 +29,7 @@ namespace BackupTables
 
             Console.WriteLine($"Saving blob to {name}");
 
+            using (var logger = new ThrottledLogger())
             using (var stream = reader.GetStream(field))
             using (var file = new FileStream(Path.Combine(folder, name), FileMode.Create, FileAccess.Write))
             {
@@ -40,7 +40,7 @@ namespace BackupTables
                     file.Write(buffer, 0, got);
 
                     total += got;
-                    logger.Add($"-- saved {total} bytes so far");
+                    logger.Update($"Saved {total} bytes");
                 }
             }
 
@@ -50,7 +50,6 @@ namespace BackupTables
 
         private static void Export(string fileName, IEnumerable<string> tables, SqlConnection conn)
         {
-            var logger = new ThrottledLogger();
             var records = 0;
     
             var rootElem = new XElement("tables");
@@ -68,13 +67,14 @@ namespace BackupTables
                 {
                     command.CommandText = @"SELECT * FROM " + table;
 
+                    using (var logger = new ThrottledLogger())
                     using (var reader = command.ExecuteReader())
                     {
                         while (reader.Read())
                         {
                             records++;
 
-                            logger.Add($"-- exported {records} records so far");
+                            logger.Update($"Exported {records} records");
 
                             var recordElem = new XElement("record");
                             tableElem.Add(recordElem);
@@ -168,8 +168,6 @@ INNER JOIN (
 
         private static void Import(string fileName, Dictionary<string, string> mappings, bool delete, SqlConnection conn)
         {
-            var logger = new ThrottledLogger();
-
             Console.WriteLine($"Reading import file {fileName}...");
 
             var doc = XDocument.Load(fileName);
@@ -247,15 +245,15 @@ INNER JOIN (
 
             sortedTables.Reverse();
 
+            var exceptions = new List<(Exception error, string table, XElement record)>();
+
             foreach (var tableElem in sortedTables)
             {
                 var table = (string)tableElem.Attribute("name");
 
                 Console.WriteLine($"Reading schema of table: {table}");
 
-                string mappedTable;
-
-                if (!mappings.TryGetValue(table, out mappedTable))
+                if (!mappings.TryGetValue(table, out string mappedTable))
                 {
                     mappedTable = table;
                 }
@@ -286,100 +284,121 @@ INNER JOIN (
                 }
 
                 var inserted = 0;
+                var errors = 0;
 
                 Console.WriteLine($"Importing table: {table}");
 
-                foreach (var recordElem in tableElem.Descendants("record"))
+                using (var logger = new ThrottledLogger())
                 {
-                    using (var command = new SqlCommand(null, conn))
+                    foreach (var recordElem in tableElem.Descendants("record"))
                     {
-                        var columns = new List<string>();
-
-                        foreach (var destColumn in columnTypes.Keys)
+                        using (var command = new SqlCommand(null, conn))
                         {
-                            string sourceColumn;
-                            if (!mappings.TryGetValue(destColumn, out sourceColumn))
+                            var columns = new List<string>();
+
+                            foreach (var destColumn in columnTypes.Keys)
                             {
-                                sourceColumn = destColumn;
-                            }
-
-                            var fieldElem = recordElem.Descendants("field").FirstOrDefault(f => (string)f.Attribute("name") == sourceColumn);
-
-                            if (fieldElem == null)
-                            {
-                                var sqlType = columnTypes[destColumn];
-                                var columnSize = columnSizes[destColumn];
-                                var columnPrecis = columnPrecisions[destColumn];
-                                var columnScale = columnScales[destColumn];
-
-                                object val = null;
-                                if (sqlType == SqlDbType.Bit)
+                                string sourceColumn;
+                                if (!mappings.TryGetValue(destColumn, out sourceColumn))
                                 {
-                                    val = 0;
-                                } 
-                                else if (sqlType == SqlDbType.DateTime2)
-                                {
-                                    val = DateTime.Now;
-                                }
-                                else if (sqlType == SqlDbType.UniqueIdentifier)
-                                {
-                                    val = Guid.Empty;
+                                    sourceColumn = destColumn;
                                 }
 
-                                if (val != null)
-                                {
-                                    columns.Add(destColumn);
-                                    command.Parameters.Add(new SqlParameter("@p" + destColumn, sqlType, columnSize)
-                                    {
-                                        Value = val,
-                                        Precision = (byte)columnPrecis,
-                                        Scale = (byte)columnScale
-                                    });
-                                }
-                            }
-                            else
-                            {
-                                var typeName = (string)fieldElem.Attribute("type");
-                                var isNull = !string.IsNullOrWhiteSpace((string)fieldElem.Attribute("null"));
+                                var fieldElem = recordElem.Descendants("field").FirstOrDefault(f => (string)f.Attribute("name") == sourceColumn);
 
-                                if (!isNull)
-                                {                                    
-                                    var value = FromString(fieldElem.Value, Type.GetType(typeName));
+                                if (fieldElem == null)
+                                {
                                     var sqlType = columnTypes[destColumn];
                                     var columnSize = columnSizes[destColumn];
                                     var columnPrecis = columnPrecisions[destColumn];
                                     var columnScale = columnScales[destColumn];
-                                    
-                                    if (sqlType == SqlDbType.NVarChar)
+
+                                    object val = null;
+                                    if (sqlType == SqlDbType.Bit)
                                     {
-                                        columnSize = value != null ? value.ToString().Length : 0;
+                                        val = 0;
+                                    }
+                                    else if (sqlType == SqlDbType.DateTime2)
+                                    {
+                                        val = DateTime.Now;
+                                    }
+                                    else if (sqlType == SqlDbType.UniqueIdentifier)
+                                    {
+                                        val = Guid.Empty;
                                     }
 
-                                    if (sqlType != SqlDbType.NVarChar || columnSize != 0)
+                                    if (val != null)
                                     {
                                         columns.Add(destColumn);
                                         command.Parameters.Add(new SqlParameter("@p" + destColumn, sqlType, columnSize)
                                         {
-                                            Value = value,
+                                            Value = val,
                                             Precision = (byte)columnPrecis,
                                             Scale = (byte)columnScale
                                         });
                                     }
                                 }
+                                else
+                                {
+                                    var typeName = (string)fieldElem.Attribute("type");
+                                    var isNull = !string.IsNullOrWhiteSpace((string)fieldElem.Attribute("null"));
+
+                                    if (!isNull)
+                                    {
+                                        var value = FromString(fieldElem.Value, Type.GetType(typeName));
+                                        var sqlType = columnTypes[destColumn];
+                                        var columnSize = columnSizes[destColumn];
+                                        var columnPrecis = columnPrecisions[destColumn];
+                                        var columnScale = columnScales[destColumn];
+
+                                        if (sqlType == SqlDbType.NVarChar)
+                                        {
+                                            columnSize = value != null ? value.ToString().Length : 0;
+                                        }
+
+                                        if (sqlType != SqlDbType.NVarChar || columnSize != 0)
+                                        {
+                                            columns.Add(destColumn);
+                                            command.Parameters.Add(new SqlParameter("@p" + destColumn, sqlType, columnSize)
+                                            {
+                                                Value = value,
+                                                Precision = (byte)columnPrecis,
+                                                Scale = (byte)columnScale
+                                            });
+                                        }
+                                    }
+                                }
                             }
+
+                            command.CommandText = @"INSERT INTO " + table + "(" +
+                                                  string.Join(",", columns.Select(c => "[" + c + "]")) + ") VALUES (" +
+                                                  string.Join(",", columns.Select(c => "@p" + c)) + ")";
+                            command.Prepare();
+                            try
+                            {
+                                inserted += command.ExecuteNonQuery();
+                            }
+                            catch (Exception x)
+                            {
+                                errors++;
+                                x = x.GetBaseException();
+                                exceptions.Add((x, table, recordElem));
+                            }
+
+                            logger.Update($"{inserted} records inserted, {errors} failures");
                         }
-
-                        command.CommandText = @"INSERT INTO " + table + "(" +
-                                              string.Join(",", columns.Select(c => "[" + c + "]")) + ") VALUES (" +
-                                              string.Join(",", columns.Select(c => "@p" + c)) + ")";
-                        command.Prepare();
-                        inserted += command.ExecuteNonQuery();
-
-                        logger.Add($"-- imported {inserted} records so far");
                     }
                 }
 
-                Console.WriteLine($"Finished importing {table}, {inserted} records");
+                Console.WriteLine($"Finished importing {table}, {inserted} records, {errors} failures");
+            }
+
+            if (exceptions.Count != 0)
+            {
+                foreach (var exception in exceptions)
+                {
+                    Console.WriteLine($"In table {exception.table}: {exception.error.Message} - data was: {exception.record}");
+                }
             }
         }
 
