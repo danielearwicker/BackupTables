@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Configuration;
 using System.Data;
 using System.Data.SqlClient;
 using System.IO;
@@ -11,18 +10,25 @@ namespace BackupTables
 {
     public class Program
     {
-        public static void WithConnection(string connectionStringName, Action<SqlConnection> action)
+        private static string GetDirectoryName(string filePath)
         {
-            using (var conn = new SqlConnection(ConfigurationManager.ConnectionStrings[connectionStringName].ConnectionString))
+            filePath = Path.GetFullPath(filePath);
+            var dirName = Path.GetDirectoryName(filePath);
+            if (dirName == null)
             {
-                conn.Open();
-                action(conn);
+                throw new IOException($"Path {filePath} has no parent directory");
             }
+            return dirName;
         }
-        
-        private static string SaveBinary(SqlDataReader reader, int field, string parentFile)
-        {            
-            var folder = Path.GetDirectoryName(parentFile);
+
+        private static string SaveBinary(SqlDataReader reader, int field, string parentFile, bool blobs)
+        {
+            if (!blobs)
+            {
+                return string.Empty;
+            }
+
+            var folder = GetDirectoryName(parentFile);
             var name = Guid.NewGuid() + ".blob";
 
             var buffer = new byte[0x10000];
@@ -33,7 +39,7 @@ namespace BackupTables
             using (var stream = reader.GetStream(field))
             using (var file = new FileStream(Path.Combine(folder, name), FileMode.Create, FileAccess.Write))
             {
-                var got = 0;
+                int got;
                 var total = 0;
                 while ((got = stream.Read(buffer, 0, buffer.Length)) != 0)
                 {
@@ -48,10 +54,8 @@ namespace BackupTables
             return name;
         }
 
-        private static void Export(string fileName, IEnumerable<string> tables, SqlConnection conn)
+        private static void Export(string fileName, IEnumerable<string> tables, SqlConnection conn, bool blobs)
         {
-            var records = 0;
-    
             var rootElem = new XElement("tables");
 
             foreach (var table in tables)
@@ -61,7 +65,7 @@ namespace BackupTables
                 rootElem.Add(tableElem);
 
                 Console.WriteLine($"Exporting table: {table}");
-                records = 0;
+                var records = 0;
 
                 using (var command = new SqlCommand(null, conn))
                 {
@@ -85,7 +89,7 @@ namespace BackupTables
                                 var type = reader.GetFieldType(f);
                                 
                                 var val = reader.IsDBNull(f) ? null : 
-                                        type == typeof(byte[]) ? SaveBinary(reader, f, fileName) : 
+                                        type == typeof(byte[]) ? SaveBinary(reader, f, fileName, blobs) : 
                                         reader.GetValue(f);
 
                                 var fieldElem = new XElement("field");
@@ -117,7 +121,7 @@ namespace BackupTables
             File.WriteAllText(fileName, rootElem.ToString());
         }
 
-        private static object FromString(string value, Type type)
+        private static object FromString(string value, Type type, string parentFile)
         {
             if (type == typeof(Guid))
             {
@@ -126,13 +130,22 @@ namespace BackupTables
 
             if (type == typeof(byte[]))
             {
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    return new byte[0];
+                }
+
+                var folder = GetDirectoryName(parentFile);
+                var fullPath = Path.Combine(folder, value);
+
                 try
                 {
-                    return Convert.FromBase64String(value);
+                    return File.ReadAllBytes(fullPath);
                 }
-                catch (Exception)
+                catch (Exception x)
                 {
-                    Console.WriteLine("WARNING: could not interpret value as base64, substituting empty byte array");
+                    Console.WriteLine($"WARNING: could not read {fullPath}, substituting empty byte array");
+                    Console.WriteLine(x.GetBaseException().Message);
                     return new byte[0];
                 }
             }
@@ -172,7 +185,7 @@ INNER JOIN (
 
             var doc = XDocument.Load(fileName);
             
-            var tableElements = doc.Descendants("table");
+            var tableElements = doc.Descendants("table").ToList();
 
             string TableName(XElement table)
             {
@@ -345,7 +358,7 @@ INNER JOIN (
 
                                     if (!isNull)
                                     {
-                                        var value = FromString(fieldElem.Value, Type.GetType(typeName));
+                                        var value = FromString(fieldElem.Value, Type.GetType(typeName), fileName);
                                         var sqlType = columnTypes[destColumn];
                                         var columnSize = columnSizes[destColumn];
                                         var columnPrecis = columnPrecisions[destColumn];
@@ -353,7 +366,7 @@ INNER JOIN (
 
                                         if (sqlType == SqlDbType.NVarChar)
                                         {
-                                            columnSize = value != null ? value.ToString().Length : 0;
+                                            columnSize = value?.ToString().Length ?? 0;
                                         }
 
                                         if (sqlType != SqlDbType.NVarChar || columnSize != 0)
@@ -402,41 +415,93 @@ INNER JOIN (
             }
         }
 
-        public static void Main(string[] args)
+        private static int Usage()
         {
-            var mode = args[1];
-            var fileName = args[2];
-            var delete = args.Length >= 4 && args[3] == "delete";
+            Console.WriteLine();
+            Console.WriteLine("Specify arguments as name=value pairs, e.g. f=text.xml");
+            Console.WriteLine();
+            Console.WriteLine("Required:");
+            Console.WriteLine();
+            Console.WriteLine("  f, filename");
+            Console.WriteLine("  d, database");
+            Console.WriteLine();
+            Console.WriteLine("Optional:");
+            Console.WriteLine();
+            Console.WriteLine("  m, mode      -- import|export, default is export)");
+            Console.WriteLine("  s, server    -- default is local");
+            Console.WriteLine("  u, username  -- default is impersonation");
+            Console.WriteLine("  p, password  -- required if username specified");
+            Console.WriteLine("  t, tables    -- which tables to export (comma separated)");
+            Console.WriteLine("  b, blobs     -- true|false, default is true, blobs are exported");
+            Console.WriteLine("  c, clobber   -- true|false, default is false, import deletes all existing records");
+            Console.WriteLine();
+            return -1;
+        }
 
-            WithConnection(args[0], conn =>
+        private static string GetValue(IReadOnlyDictionary<string, string> options, string key, string defaultValue)
+        {
+            return options.TryGetValue(key, out string value1) ? value1 :
+                   options.TryGetValue(key.Substring(0, 1), out string value2) ? value2 : defaultValue;
+        }
+
+        public static int Main(string[] args)
+        {
+            var options = (
+
+                from arg in args
+                let split = arg.Split('=')
+                where split.Length > 1
+                select new {key = split[0], value = string.Join("=", split.Skip(1))}
+
+            ).ToDictionary(p => p.key, p => p.value);
+
+            var filename = GetValue(options, "filename", string.Empty);
+            var database = GetValue(options, "database", string.Empty);            
+            var mode = GetValue(options, "mode", "export");
+            var server = GetValue(options, "server", ".");
+            var username = GetValue(options, "username", string.Empty);
+            var password = GetValue(options, "password", string.Empty);
+            var clobber = GetValue(options, "clobber", string.Empty);
+            var tables = GetValue(options, "tables", string.Empty).Split(',').Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
+            var blobs = GetValue(options, "blobs", "true") != "false";
+
+            if (filename.Length == 0 || database.Length == 0)
             {
+                return Usage();
+            }
+
+            var security = username.Length == 0 ? "Integrated Security=true" : $"User Id={username};Password={password}";
+            var connStr = $"Data Source={server};Initial Catalog={database};{security};MultipleActiveResultSets=True";
+
+            using (var conn = new SqlConnection(connStr))
+            {
+                conn.Open();
+                
                 switch (mode)
                 {
                     case "export":
-                        string[] tables;
-                        if (args.Length == 3)
+                    case "e":
+                        if (tables.Length == 0)
                         {
                             tables = conn.GetSchema("Tables").Select()
                                          .Where(r => r[3].ToString().ToLowerInvariant() != "view")
                                          .Select(r => $"[{r[1]}].[{r[2]}]").ToArray();
                         }
-                        else
-                        {
-                            tables = args[3].Split(',');
-                        }
-                        
-                        Export(fileName, tables, conn);
+                        Export(filename, tables, conn, blobs);
                         break;
 
                     case "import":
-                        //var mappings = (args.Length < 4 ? string.Empty : args[3]).Split(',')
-                        //                    .Select(m => m.Split('='))
-                        //                    .ToDictionary(m => m[0], m => m[1]);
+                    case "i":
                         var mappings = new Dictionary<string, string>();
-                        Import(fileName, mappings, delete, conn);
+                        Import(filename, mappings, clobber == "true", conn);
                         break;
+
+                    default:
+                        return Usage();
                 }
-            });
+            }
+
+            return 0;
         }
     }
 }
